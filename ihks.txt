@@ -1,0 +1,137 @@
+const axios = require('axios');
+const cheerio = require('cheerio');
+
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+  "Connection": "keep-alive",
+  "Upgrade-Insecure-Requests": "1",
+  "Sec-Ch-Ua": "\"Google Chrome\";v=\"125\", \"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\"",
+  "Sec-Ch-Ua-Mobile": "?0",
+  "Sec-Ch-Ua-Platform": "\"Windows\"",
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "same-origin",
+  "Sec-Fetch-User": "?1",
+  "TE": "trailers"
+};
+
+const BASE_URL = 'https://komiku.org';
+
+async function searchComics(query) {
+  const searchUrl = `${BASE_URL}/?s=${encodeURIComponent(query)}&post_type=manga`;
+  try {
+    const response = await axios.get(searchUrl, { headers: HEADERS });
+    const $ = cheerio.load(response.data);
+    const results = [];
+
+    $('.ls2').each((i, el) => {
+      const $el = $(el);
+      const title = $el.find('.kan h3 a').text().trim();
+      const detailUrl = $el.find('.kan h3 a').attr('href');
+      const cover = $el.find('.img-list img').attr('data-src') || $el.find('.img-list img').attr('src');
+
+      if (title && detailUrl) {
+        results.push({ title, detailUrl, cover: cover || null });
+      }
+    });
+    return results;
+  } catch (error) {
+    return [];
+  }
+}
+
+async function getComicDetails(detailUrl) {
+  try {
+    const response = await axios.get(detailUrl, { headers: HEADERS });
+    const $ = cheerio.load(response.data);
+
+    const title = $('.judul').text().trim();
+    const cover = $('.perapih .thumb img').attr('src');
+    const synopsis = $('.desc').text().trim();
+    
+    const details = {};
+    $('.info p').each((i, el) => {
+        const text = $(el).text().trim();
+        if (text.includes(':')) {
+            const [key, value] = text.split(':', 2).map(s => s.trim());
+            details[key.toLowerCase().replace(/\s/g, '')] = value;
+        }
+    });
+
+    const genres = [];
+    $('.genre a').each((i, el) => {
+      genres.push($(el).text().trim());
+    });
+
+    const chapters = [];
+    $('.chapter li a').each((i, el) => {
+      const chapterName = $(el).text().trim();
+      const chapterUrl = $(el).attr('href');
+      if (chapterName && chapterUrl) {
+        chapters.push({ name: chapterName, url: chapterUrl });
+      }
+    });
+
+    return {
+      title,
+      cover: cover || null,
+      synopsis,
+      type: details.tipe || null,
+      status: details.status || null,
+      author: details.author || null,
+      genres,
+      chapters
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+async function getChapterImages(chapterUrl) {
+  try {
+    const response = await axios.get(chapterUrl, { headers: HEADERS });
+    const $ = cheerio.load(response.data);
+    const imageUrls = [];
+
+    $('#Baca_Komik img').each((i, el) => {
+      const src = $(el).attr('data-src') || $(el).attr('src');
+      if (src) {
+        imageUrls.push(src);
+      }
+    });
+    return imageUrls;
+  } catch (error) {
+    return [];
+  }
+}
+
+async function scrapeKomiku(query) {
+  const searchResults = await searchComics(query);
+  const scrapedData = [];
+
+  for (const result of searchResults) {
+    const comicDetails = await getComicDetails(result.detailUrl);
+    if (comicDetails) {
+      const chaptersWithImages = [];
+      for (const chapter of comicDetails.chapters) {
+        const imageUrls = await getChapterImages(chapter.url);
+        chaptersWithImages.push({
+          ...chapter,
+          imageUrls
+        });
+      }
+      scrapedData.push({
+        ...comicDetails,
+        chapters: chaptersWithImages
+      });
+    }
+  }
+  return scrapedData;
+}
+
+module.exports = {
+  scrapeKomiku
+};
