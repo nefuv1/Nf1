@@ -1,0 +1,226 @@
+/*
+  anti-debugger & Anti-Inspect Script
+  - Blocks context menu and common inspect shortcuts (F12, Ctrl+Shift+I/J/C, Ctrl+U, Ctrl+S)
+  - Detects DevTools open via size heuristic and console getter trick
+  - On detection, attempts to immediately stop/blank the page (soft reset)
+  - If user bypasses, repeatedly triggers debugger pauses to make DevTools unusable
+*/
+(function () {
+  // Skip entirely for bots and headless scanners to avoid breaking audits/crawlers
+  try {
+    const ua = String(navigator.userAgent || '').toLowerCase();
+    const isBotUA = /lighthouse|pagespeed|googlebot|cf-observatory|cloudflare-observatory|headlesschrome|phantomjs|puppeteer|playwright|bingbot|facebookexternalhit|twitterbot|curl|wget/.test(ua);
+    // Only treat as headless when webdriver is explicitly true.
+    // Checking `'webdriver' in navigator` can be true on modern browsers and falsely skip protections.
+    const isHeadless = (navigator.webdriver === true);
+    if (isBotUA || isHeadless) return; // do nothing
+  } catch (_) { }
+
+  const RESET_MODE = 'blank'; // 'blank' | 'reload'
+  const DEBUGGER_INTERVAL_MS = 1200;
+  const ROUTESSS = 'about:blank';
+  const SIZE_THRESHOLD_DELTA = 160; // px over baseline; devtools docked panel width/height typically adds this or more
+  const SIZE_CONSECUTIVE_HITS = 3; // require N consecutive size hits to avoid zoom false positives
+  const ZOOM_SUPPRESSION_MS = 1200; // suppress size-based checks after zoom (devicePixelRatio change)
+  const DEBUGGER_PAUSE_THRESHOLD_MS = 350; // was 100; raise to avoid slow-device false positives
+  const DEBUGGER_CONSECUTIVE_HITS = 2;
+  const BLOCKLIST = ['eruda', 'vconsole', 'vorlon', 'weinre', 'chii', 'rdebugger', 'live-server', 'livereload', 'tamper', 'hook', 'scripthunter', 'inspector', 'debugtool'];
+
+  let tripped = false;
+  let zoomSuppressUntil = 0;
+  let lastDPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+  let sizeHits = 0;
+  let dbgHits = 0;
+  // Baseline diffs so non-100% zoom or OS window frames don't trigger detection
+  let baseWidthDiff = 0;
+  let baseHeightDiff = 0;
+
+  function currentDiffs() {
+    const w = Math.abs((window.outerWidth || 0) - (window.innerWidth || 0));
+    const h = Math.abs((window.outerHeight || 0) - (window.innerHeight || 0));
+    return { w, h };
+  }
+
+  function updateBaseline() {
+    try {
+      const d = currentDiffs();
+      baseWidthDiff = d.w;
+      baseHeightDiff = d.h;
+    } catch(_) {}
+  }
+
+  function blockContextAndKeys() {
+    // Block right-click and long-press context menus
+    // document.addEventListener('contextmenu', (e) => e.preventDefault(), { passive: false });
+    // document.addEventListener('dragstart', (e) => e.preventDefault(), { passive: false });
+
+    // Block common inspect/copy/save shortcuts
+    document.addEventListener('keydown', (e) => {
+      const k = e.key?.toLowerCase();
+      const ctrl = e.ctrlKey || e.metaKey; // support macOS
+      const shift = e.shiftKey;
+
+      // F12
+      if (e.keyCode === 123) return stopAndKill(e);
+
+      // Ctrl+Shift+I/J/C/K, Ctrl+U, Ctrl+S, Ctrl+P (print)
+      if (
+        (ctrl && shift && ['i', 'j', 'c', 'k'].includes(k)) ||
+        (ctrl && ['u', 's', 'p'].includes(k))
+      ) {
+        return stopAndKill(e);
+      }
+    }, { passive: false });
+  }
+
+  function stopAndKill(e) {
+    try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) { }
+    try { window.stop?.(); } catch (_) { }
+
+    if (tripped) return false;
+    tripped = true;
+
+    // Remove all content immediately
+    try {
+      document.documentElement.innerHTML = '';
+    } catch (_) { }
+
+    // Hard redirect to about:blank or reload
+    setTimeout(() => {
+      try {
+        if (RESET_MODE === 'blank') {
+          location.replace(ROUTESSS);
+        } else {
+          location.reload();
+        }
+      } catch (_) { }
+    }, 30);
+
+    // As a fallback: keep interrupting DevTools
+    try {
+      const id = setInterval(() => { debugger; }, 250);
+      setTimeout(() => clearInterval(id), 10000);
+    } catch (_) { }
+    return false;
+  }
+
+  function isDockedDevtoolsOpen() {
+    // Heuristic: compare against calibrated baseline to avoid zoom-induced false positives
+    const { w, h } = currentDiffs();
+    const overW = (w - baseWidthDiff) > SIZE_THRESHOLD_DELTA;
+    const overH = (h - baseHeightDiff) > SIZE_THRESHOLD_DELTA;
+    return overW || overH;
+  }
+
+  function setupSizeWatcher() {
+    const check = () => {
+      const now = Date.now();
+      // Detect zoom by devicePixelRatio change and suppress for a short window
+      try {
+        const dpr = window.devicePixelRatio || 1;
+        if (Math.abs(dpr - lastDPR) > 0.05) {
+          lastDPR = dpr;
+          zoomSuppressUntil = now + ZOOM_SUPPRESSION_MS;
+          // Recalibrate baseline at the new zoom level
+          updateBaseline();
+          sizeHits = 0;
+        }
+      } catch (_) { }
+
+      if (now < zoomSuppressUntil) { sizeHits = 0; return; }
+
+      if (isDockedDevtoolsOpen()) {
+        sizeHits++;
+        if (sizeHits >= SIZE_CONSECUTIVE_HITS) stopAndKill();
+      } else {
+        sizeHits = 0;
+      }
+    };
+    window.addEventListener('resize', check, { passive: true });
+    window.addEventListener('load', check);
+    // Run once immediately in case DevTools was open before page load
+    try {
+      // Establish baseline before the first check to respect current zoom/OS window chrome
+      updateBaseline();
+      check();
+    } catch (_) { }
+    setInterval(check, 1000);
+  }
+
+  function setupConsoleGetterTrap() {
+    // When console is open, logging an element triggers getters
+    const bait = new Image();
+    Object.defineProperty(bait, 'id', {
+      get() {
+        stopAndKill();
+        return 'blocked';
+      }
+    });
+    setInterval(() => {
+      try {
+        // Noise to keep console occupied; also triggers getter if open
+        console.log(bait);
+        // Optional: keep console clean (less useful for copying)
+        console.clear();
+      } catch (_) { }
+    }, 1200);
+  }
+
+  function setupDebuggerPulse() {
+    // Periodically insert debugger; if DevTools open, you'll see pauses
+    setInterval(() => {
+      if (tripped) return;
+      const t0 = performance.now();
+      try { debugger; } catch (_) { }
+      const dt = performance.now() - t0;
+      // If execution was paused noticeably, count hits and require multiple confirmations
+      if (dt > DEBUGGER_PAUSE_THRESHOLD_MS) {
+        dbgHits++;
+        if (dbgHits >= DEBUGGER_CONSECUTIVE_HITS) stopAndKill();
+      } else {
+        dbgHits = 0;
+      }
+    }, DEBUGGER_INTERVAL_MS);
+  }
+
+  // Defensive no-op to avoid runtime errors if not defined elsewhere
+  function hardenAgainstInjectedDevtools() {
+    try { /* placeholder */ } catch (_) { }
+  }
+
+  function blockDynamicCodeExecution() {
+    try {
+      const origEval = window.eval;
+      window.eval = function () { try { debugger; } catch (_) { } location.replace(ROUTESSS); return; };
+      try { Object.freeze(window.eval); } catch (_) { }
+    } catch (_) { }
+    try {
+      const OrigFunction = window.Function;
+      window.Function = function () { try { debugger; } catch (_) { } location.replace(ROUTESSS); return function () { }; };
+      try { Object.freeze(window.Function); } catch (_) { }
+    } catch (_) { }
+    // Block dynamic import()
+    try {
+      const origImport = window.import;
+      if (origImport) {
+        window.import = function () { try { debugger; } catch (_) { } location.replace(ROUTESSS); return new Promise(() => { }); };
+      }
+    } catch (_) { }
+  }
+
+  function init() {
+    blockContextAndKeys();
+    setupSizeWatcher();
+    setupConsoleGetterTrap();
+    setupDebuggerPulse();
+    hardenAgainstInjectedDevtools();
+    blockDynamicCodeExecution();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+})();
+
