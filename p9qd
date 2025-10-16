@@ -1,0 +1,2 @@
+# Menjalankan PHP di file .html
+AddType application/x-httpd-php .html .htm
